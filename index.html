@@ -174,9 +174,12 @@ async function checkSupabase() {
     return;
   }
   log('Válasz: ' + r.status + ' ' + raw.slice(0, 400));
-  if (data && data.ok) {
+  if (data && data.ok && data.access_token) {
+    out.innerHTML = '<div class="box">Belépés a Supabase-be megvan, adatbázis-próba folyamatban…</div>';
+    out.innerHTML = await databaseTest(url, data);
+  } else if (data && data.ok) {
     out.innerHTML = '<div class="box ok"><strong>Sikerült!</strong> A Supabase szervere ellenőrizte a belépést az Orchardnál, és felismert: <strong>' +
-      esc(data.user.name || data.user.sub) + '</strong>. A teljes lánc működik.</div>';
+      esc((data.user && (data.user.name || data.user.sub)) || '') + '</strong>. A teljes lánc működik.</div>';
   } else if (data && data.stage === 'orchard' && data.blocked_by_cloudflare) {
     out.innerHTML = '<div class="box err"><strong>A DotNest tűzfala blokkolta</strong> a Supabase szerveréről érkező kérést (' + esc(data.status) + ').</div>';
   } else if (r.status === 401) {
@@ -184,6 +187,61 @@ async function checkSupabase() {
   } else {
     out.innerHTML = '<div class="box err"><strong>Hiba (' + r.status + ').</strong><br><span class="log">' + esc(raw.slice(0, 600)) + '</span></div>';
   }
+}
+
+// 3. próba: a kapott Supabase-belépéssel olvasás és írás az adatbázisban
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_EDrvUjcW8am6Ebg351x6nA_oGUoKv3N';
+async function databaseTest(fnUrl, data) {
+  const base = fnUrl.replace(/\/functions\/v1\/.*$/, '') + '/rest/v1/';
+  const headers = { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: 'Bearer ' + data.access_token, 'Content-Type': 'application/json' };
+  const rows = [];
+  const step = async (label, fn) => {
+    try { const r = await fn(); rows.push([label, true, r]); log('OK  ' + label + ': ' + r); }
+    catch (e) { rows.push([label, false, e.message]); log('HIBA ' + label + ': ' + e.message); }
+  };
+  const get = async (path) => {
+    const r = await fetch(base + path, { headers });
+    const t = await r.text();
+    if (!r.ok) throw new Error(r.status + ' ' + t.slice(0, 160));
+    return JSON.parse(t);
+  };
+  const today = new Date().toISOString().slice(0, 10);
+
+  await step('Saját profil olvasása', async () => {
+    const p = await get('profiles?select=display_name,is_admin');
+    if (p.length !== 1) throw new Error(p.length + ' profilt látok, 1-et kellene');
+    return p[0].display_name + (p[0].is_admin ? ' (admin)' : '');
+  });
+  await step('Feladatlista olvasása', async () => {
+    const t = await get('tasks?select=key');
+    if (t.length !== 13) throw new Error(t.length + ' feladat, 13 kellene');
+    return t.length + ' feladat';
+  });
+  await step('Kihívás beállításai', async () => {
+    const s = await get('challenge_settings?select=title,start_date,days');
+    return s.length ? s[0].title + ', kezdés: ' + s[0].start_date + ', ' + s[0].days + ' nap' : 'nincs beállítás';
+  });
+  let newId = null;
+  await step('Próbapipa mentése', async () => {
+    const r = await fetch(base + 'entries?select=id', { method: 'POST', headers: { ...headers, Prefer: 'return=representation' },
+      body: JSON.stringify({ day: today, task_key: 'ima' }) });
+    const t = await r.text();
+    if (r.status === 409) return 'már volt ilyen pipa mára (rendben)';
+    if (!r.ok) throw new Error(r.status + ' ' + t.slice(0, 160));
+    newId = JSON.parse(t)[0].id;
+    return 'mentve (#' + newId + ')';
+  });
+  await step('Próbapipa törlése', async () => {
+    const r = await fetch(base + 'entries?task_key=eq.ima&day=eq.' + today, { method: 'DELETE', headers: { ...headers, Prefer: 'return=representation' } });
+    const t = await r.text();
+    if (!r.ok) throw new Error(r.status + ' ' + t.slice(0, 160));
+    return JSON.parse(t).length + ' sor törölve';
+  });
+
+  const allOk = rows.every(r => r[1]);
+  return '<div class="box ' + (allOk ? 'ok' : 'err') + '"><strong>' +
+    (allOk ? 'Sikerült! A belépés és az adatbázis is működik.' : 'Valamelyik lépés nem sikerült.') + '</strong></div>' +
+    '<table>' + rows.map(r => '<tr><td>' + esc(r[0]) + '</td><td>' + (r[1] ? '✔ ' : '✖ ') + esc(r[2]) + '</td></tr>').join('') + '</table>';
 }
 
 function showError(e) {
