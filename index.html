@@ -111,6 +111,7 @@ async function finishLogin(params) {
       log(u.ok ? 'Userinfo OK.' : 'Userinfo nem elérhető (' + u.status + ').');
     } catch { log('Userinfo hívás sikertelen (CORS?).'); }
   }
+  window.__orchardToken = tok.access_token;
   showResult(decodeJwt(tok.id_token || '') || {}, info, decodeJwt(tok.access_token || ''), cfg);
 }
 
@@ -133,8 +134,56 @@ function showResult(idt, info, at, cfg) {
       '<li>Nyiss egy privát ablakot, ott lépj be az Orchardba, majd nyisd meg ezt az oldalt és kattints a gombra: jelszót már nem szabad kérnie.</li>' +
       '<li>Jelentkezz ki az Orchardból, és próbáld újra: ekkor a belépő oldalnak kell megjelennie.</li>' +
     '</ol>' +
-    '<p><button class="btn" onclick="startLogin()">Újra</button> ' +
+    '<h3>2. próba: ellenőrzés a Supabase-en keresztül</h3>' +
+    '<p>Másold be a Supabase függvény címét (…supabase.co/functions/v1/orchard-exchange), majd kattints az Ellenőrzés gombra.</p>' +
+    '<p><input id="fnUrl" type="url" placeholder="https://xxxx.supabase.co/functions/v1/orchard-exchange" ' +
+      'style="width:100%;padding:.7rem;border:1px solid #bdbdbd;font-size:1rem" value="' + esc(loadFnUrl()) + '"></p>' +
+    '<p><button class="btn" onclick="checkSupabase()">Ellenőrzés</button></p>' +
+    '<div id="sbResult"></div>' +
+    '<p style="margin-top:2rem"><button class="btn ghost" onclick="startLogin()">Újra</button> ' +
     (cfg.end_session_endpoint ? '<a class="btn ghost" href="' + esc(cfg.end_session_endpoint) + '">Kijelentkezés</a>' : '') + '</p>';
+}
+
+const DEFAULT_FN_URL = 'https://vnxpaiylghosiumyroep.supabase.co/functions/v1/orchard-exchange';
+function loadFnUrl() { try { return localStorage.getItem('szak_fn_url') || DEFAULT_FN_URL; } catch { return DEFAULT_FN_URL; } }
+function saveFnUrl(v) { try { localStorage.setItem('szak_fn_url', v); } catch {} }
+
+async function checkSupabase() {
+  const out = document.getElementById('sbResult');
+  const url = document.getElementById('fnUrl').value.trim();
+  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co\/functions\/v1\/[\w-]+$/i.test(url)) {
+    out.innerHTML = '<div class="box err">A cím nem tűnik Supabase függvénycímnek. Formája: https://xxxx.supabase.co/functions/v1/orchard-exchange</div>';
+    return;
+  }
+  saveFnUrl(url);
+  if (!window.__orchardToken) {
+    out.innerHTML = '<div class="box err">Nincs friss Orchard-token. Kattints az Újra gombra, lépj be, és utána próbáld újra.</div>';
+    return;
+  }
+  out.innerHTML = '<div class="box">Ellenőrzés folyamatban…</div>';
+  log('Supabase függvény hívása: ' + url);
+  let r, data, raw = '';
+  try {
+    r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({ orchard_token: window.__orchardToken }) });
+    raw = await r.text();
+    try { data = JSON.parse(raw); } catch { data = null; }
+  } catch (e) {
+    log('Hívás sikertelen: ' + e.message);
+    out.innerHTML = '<div class="box err"><strong>Nem érte el a függvényt.</strong> Valószínű okok: rossz cím, a függvény nincs telepítve, vagy a CORS nincs rendben.</div>';
+    return;
+  }
+  log('Válasz: ' + r.status + ' ' + raw.slice(0, 400));
+  if (data && data.ok) {
+    out.innerHTML = '<div class="box ok"><strong>Sikerült!</strong> A Supabase szervere ellenőrizte a belépést az Orchardnál, és felismert: <strong>' +
+      esc(data.user.name || data.user.sub) + '</strong>. A teljes lánc működik.</div>';
+  } else if (data && data.stage === 'orchard' && data.blocked_by_cloudflare) {
+    out.innerHTML = '<div class="box err"><strong>A DotNest tűzfala blokkolta</strong> a Supabase szerveréről érkező kérést (' + esc(data.status) + ').</div>';
+  } else if (r.status === 401) {
+    out.innerHTML = '<div class="box err"><strong>A Supabase elutasította a hívást (401).</strong> Valószínűleg be van kapcsolva a függvénynél a JWT-ellenőrzés; azt ki kell kapcsolni.</div>';
+  } else {
+    out.innerHTML = '<div class="box err"><strong>Hiba (' + r.status + ').</strong><br><span class="log">' + esc(raw.slice(0, 600)) + '</span></div>';
+  }
 }
 
 function showError(e) {
