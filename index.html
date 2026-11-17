@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SZAK – belépési próba</title>
+<style>
+  :root { --black:#0a0a0a; --orange:#e8591a; --line:#e4e4e4; --grey:#6a6a6a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:'Segoe UI', Arial, sans-serif; color:var(--black); background:#fff; }
+  header { background:var(--black); color:#fff; border-top:14px solid var(--orange); padding:2.5rem 1rem; text-align:center; }
+  header h1 { font-family:'Courier New', monospace; text-transform:uppercase; letter-spacing:.04em; margin:0; font-size:clamp(1.6rem,4vw,2.6rem); }
+  main { max-width:720px; margin:2.5rem auto; padding:0 1rem; }
+  .btn { display:inline-block; background:var(--orange); color:#fff; border:2px solid var(--orange); padding:.8rem 1.6rem;
+         font-family:'Courier New', monospace; font-weight:700; text-transform:uppercase; letter-spacing:.06em; cursor:pointer; text-decoration:none; }
+  .btn:hover { background:var(--black); border-color:var(--black); }
+  .btn.ghost { background:transparent; color:var(--black); border-color:var(--black); }
+  .box { border:1px solid var(--line); border-left:5px solid var(--orange); padding:1rem 1.25rem; margin:1.25rem 0; }
+  .ok { border-left-color:#1a7f37; } .err { border-left-color:#c62828; }
+  table { border-collapse:collapse; width:100%; font-size:.95rem; }
+  td { border-bottom:1px solid var(--line); padding:.45rem .3rem; vertical-align:top; word-break:break-all; }
+  td:first-child { color:var(--grey); width:35%; word-break:normal; }
+  ol li { margin-bottom:.35rem; }
+  .log { font-family:Consolas, monospace; font-size:.8rem; color:var(--grey); white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<header><h1>Belépési próba</h1></header>
+<main>
+  <p>Ez az oldal azt ellenőrzi, hogy a SZAK Orchard-oldala be tud-e léptetni egy külső alkalmazásba.</p>
+  <div id="view"></div>
+  <details><summary>Részletes napló</summary><div id="log" class="log"></div></details>
+</main>
+
+<script>
+// ===== Beállítások =====
+const ISSUER = 'https://szakszentandrskr.dotnest.net';
+const CLIENT_ID = 'szak-proba';
+const REDIRECT_URI = location.origin + location.pathname;   // ennek egyeznie kell az Orchardban megadott Redirect URI-val
+const SCOPE = 'openid profile email';
+
+const view = document.getElementById('view');
+const logEl = document.getElementById('log');
+const log = (m) => { logEl.textContent += new Date().toLocaleTimeString() + '  ' + m + '\n'; };
+
+const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const randomString = () => b64url(crypto.getRandomValues(new Uint8Array(32)));
+async function sha256(text) { return b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))); }
+function decodeJwt(token) {
+  try { const p = token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'); return JSON.parse(decodeURIComponent(escape(atob(p)))); }
+  catch { return null; }
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function discovery() {
+  log('OpenID konfiguráció lekérése…');
+  const r = await fetch(ISSUER + '/.well-known/openid-configuration');
+  if (!r.ok) throw new Error('A /.well-known/openid-configuration nem érhető el (' + r.status + '). Be van kapcsolva az OpenID Authorization Server?');
+  const cfg = await r.json();
+  log('Konfiguráció OK: ' + cfg.authorization_endpoint);
+  return cfg;
+}
+
+async function startLogin() {
+  try {
+    const cfg = await discovery();
+    const verifier = randomString(), state = randomString();
+    sessionStorage.setItem('pkce_verifier', verifier);
+    sessionStorage.setItem('pkce_state', state);
+    const url = new URL(cfg.authorization_endpoint);
+    url.search = new URLSearchParams({
+      response_type: 'code', client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, scope: SCOPE,
+      state, code_challenge: await sha256(verifier), code_challenge_method: 'S256'
+    });
+    location.href = url.toString();
+  } catch (e) { showError(e); }
+}
+
+async function finishLogin(params) {
+  const err = params.get('error');
+  if (err) throw new Error('Az Orchard hibát adott vissza: ' + err + ' – ' + (params.get('error_description') || ''));
+  if (params.get('state') !== sessionStorage.getItem('pkce_state')) throw new Error('A visszakapott state nem egyezik (biztonsági ellenőrzés).');
+  const cfg = await discovery();
+  log('Kód beváltása tokenre…');
+  let r;
+  try {
+    r = await fetch(cfg.token_endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code', code: params.get('code'), redirect_uri: REDIRECT_URI,
+        client_id: CLIENT_ID, code_verifier: sessionStorage.getItem('pkce_verifier')
+      })
+    });
+  } catch (e) {
+    throw new Error('A token kérése nem jutott át – valószínűleg a CORS nincs beállítva a github.io címre.');
+  }
+  const tok = await r.json();
+  if (!r.ok) throw new Error('Token hiba: ' + (tok.error || r.status) + ' – ' + (tok.error_description || ''));
+  log('Token megérkezett.');
+  sessionStorage.removeItem('pkce_verifier'); sessionStorage.removeItem('pkce_state');
+  history.replaceState(null, '', REDIRECT_URI);
+
+  let info = null;
+  if (cfg.userinfo_endpoint) {
+    log('Felhasználói adatok lekérése…');
+    try {
+      const u = await fetch(cfg.userinfo_endpoint, { headers: { Authorization: 'Bearer ' + tok.access_token } });
+      info = u.ok ? await u.json() : null;
+      log(u.ok ? 'Userinfo OK.' : 'Userinfo nem elérhető (' + u.status + ').');
+    } catch { log('Userinfo hívás sikertelen (CORS?).'); }
+  }
+  showResult(decodeJwt(tok.id_token || '') || {}, info, decodeJwt(tok.access_token || ''), cfg);
+}
+
+function row(k, v) { return v === undefined || v === null || v === '' ? '' : '<tr><td>' + esc(k) + '</td><td>' + esc(typeof v === 'object' ? JSON.stringify(v) : v) + '</td></tr>'; }
+
+function showResult(idt, info, at, cfg) {
+  const name = (info && (info.name || info.preferred_username)) || idt.name || idt.preferred_username || idt.sub;
+  view.innerHTML =
+    '<div class="box ok"><strong>Sikerült!</strong> Az Orchard beléptetett: <strong>' + esc(name || '(név nélkül)') + '</strong></div>' +
+    '<h3>Amit a követő megkapna rólad</h3><table>' +
+      row('Felhasználó azonosító (sub)', idt.sub || (info && info.sub)) +
+      row('Név', (info && info.name) || idt.name) +
+      row('Felhasználónév', (info && info.preferred_username) || idt.preferred_username) +
+      row('E-mail', (info && info.email) || idt.email) +
+      row('Szerepkörök', (info && info.role) || idt.role) +
+      row('Kiadó (iss)', idt.iss) +
+      row('Access token formátuma', at ? 'JWT (külső szerver ellenőrizni tudja)' : 'nem JWT (titkosított / referencia)') +
+    '</table>' +
+    '<h3>Teszteld még</h3><ol>' +
+      '<li>Nyiss egy privát ablakot, ott lépj be az Orchardba, majd nyisd meg ezt az oldalt és kattints a gombra: jelszót már nem szabad kérnie.</li>' +
+      '<li>Jelentkezz ki az Orchardból, és próbáld újra: ekkor a belépő oldalnak kell megjelennie.</li>' +
+    '</ol>' +
+    '<p><button class="btn" onclick="startLogin()">Újra</button> ' +
+    (cfg.end_session_endpoint ? '<a class="btn ghost" href="' + esc(cfg.end_session_endpoint) + '">Kijelentkezés</a>' : '') + '</p>';
+}
+
+function showError(e) {
+  log('HIBA: ' + e.message);
+  view.innerHTML = '<div class="box err"><strong>Nem sikerült.</strong><br>' + esc(e.message) + '</div>' +
+    '<p><button class="btn" onclick="startLogin()">Újrapróbálom</button></p>' +
+    '<p>Nyisd le a „Részletes napló” részt, és küldd el a szövegét.</p>';
+}
+
+(async () => {
+  const params = new URLSearchParams(location.search);
+  if (params.has('code') || params.has('error')) {
+    view.innerHTML = '<div class="box">Belépés folyamatban…</div>';
+    try { await finishLogin(params); } catch (e) { showError(e); }
+  } else {
+    view.innerHTML = '<p><button class="btn" onclick="startLogin()">Belépés SZAK-fiókkal</button></p>';
+  }
+})();
+</script>
+</body>
+</html>
